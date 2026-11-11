@@ -199,7 +199,12 @@ class ProjectsTab(QWidget):
 
     def current_project(self):
         item = self.projects.currentItem()
-        return self.db.get_project(item.data(Qt.ItemDataRole.UserRole)) if item else None
+        if item is None:
+            return None
+        try:
+            return self.db.get_project(item.data(Qt.ItemDataRole.UserRole))
+        except WorkflowError:  # just deleted; the list hasn't been rebuilt yet
+            return None
 
     def refresh(self, select_id: int | None = None) -> None:
         current = self.current_project()
@@ -237,7 +242,7 @@ class ProjectsTab(QWidget):
         self.commit_button.setEnabled(planning)
         self.complete_button.setEnabled(bool(project) and project.status == COMMITTED)
         self.cancel_button.setEnabled(active)
-        self.delete_button.setEnabled(planning)
+        self.delete_button.setEnabled(bool(project))
         self.summary.setText(self._summary(project, lines))
 
     def _fill_row(self, row: int, line: Line, planning: bool) -> None:
@@ -389,7 +394,12 @@ class ProjectsTab(QWidget):
         project = self.current_project()
         if project is None:
             return
-        if QMessageBox.question(self, "Delete project", f"Delete {project.name}?") != QMessageBox.StandardButton.Yes:
+        text = f"Delete {project.name}? This can't be undone."
+        if project.status == COMMITTED:
+            text += "\nIts reserved parts return to free stock and anything still pending is dropped."
+        if project.status != PLANNING:
+            text += "\nStock counts don't change, and its scans stay in History without a project."
+        if QMessageBox.question(self, "Delete project", text) != QMessageBox.StandardButton.Yes:
             return
         try:
             self.db.delete_project(project.id)

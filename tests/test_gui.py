@@ -154,3 +154,22 @@ def test_main_window_tabs_all_refresh(app, db, make_project):
     assert window.inventory_tab.table.rowCount() == 1
     assert window.history_tab.table.rowCount() == 1
     assert window.scan_tab.project.count() == 2
+
+
+def test_delete_button_works_on_reserved_project(app, db, make_project, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    stock(db, "ABC", 10)
+    project = make_project("p", [("ABC", 5)])
+    db.commit_project(project.id)
+    tab = ProjectsTab(db)
+    tab.refresh(project.id)
+    assert tab.delete_button.isEnabled()
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", lambda parent, title, text: asked.append(text) or QMessageBox.StandardButton.Yes)
+    tab.delete_button.click()
+    assert "return to free stock" in asked[0]
+    assert db.list_projects() == []
+    assert tab.projects.count() == 0
+    assert not tab.delete_button.isEnabled()
+    assert db.find_part("ABC").available == 10

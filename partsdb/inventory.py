@@ -329,9 +329,12 @@ class Inventory:
         return max(0, min(required, part.available)) if part else 0
 
     def get_project(self, project_id: int) -> Project:
-        return Project(**dict(self.conn.execute(
+        row = self.conn.execute(
             "SELECT id, name, boards, status, source_file, created_at FROM projects WHERE id = ?", (project_id,)
-        ).fetchone()))
+        ).fetchone()
+        if row is None:
+            raise WorkflowError("That project no longer exists.")
+        return Project(**dict(row))
 
     def list_projects(self, statuses: tuple[str, ...] | None = None) -> list[Project]:
         rows = self.conn.execute(
@@ -411,7 +414,10 @@ class Inventory:
         return len(rows)
 
     def delete_project(self, project_id: int) -> None:
-        self._require_planning(project_id)
+        """Remove a project in any state. Its reservations and pending parts go with it,
+        so reserved parts become free again. On-hand counts don't change, and its stock
+        moves stay in History without a project."""
+        self.get_project(project_id)
         with self.conn:
             self.conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
 
@@ -531,7 +537,7 @@ class Inventory:
                     "SELECT pr.status FROM bom_lines l JOIN projects pr ON pr.id = l.project_id WHERE l.id = ?", (line_id,)
                 ).fetchone()
                 if status is None or status["status"] != COMMITTED:
-                    raise WorkflowError("Can't undo: the project this affected has been closed.")
+                    raise WorkflowError("Can't undo: the project this affected has been closed or deleted.")
                 self._alloc(line_id, part_id, state, -delta)
             on_hand = self.get_part(move["part_id"]).on_hand - move["delta"]
             if on_hand < 0:

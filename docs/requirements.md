@@ -35,9 +35,11 @@
 
 Completing or cancelling returns unused reservations to free stock and drops anything still pending. Used quantities stay on record. Lines marked DNP never allocate anything, and any line without an MPN must get one or be marked DNP before reserving.
 
+A project can be deleted in any state. Deleting releases its reservations and drops its pending parts like cancelling does, but also removes its BOM. On-hand counts don't change, and its stock moves stay in History without a project name. Undo can't reverse a move that touched a deleted project.
+
 ## Corrections
 
-- **Undo last** reverses the most recent stock move, including its effect on reservations. It's refused if the project it touched has since been closed.
+- **Undo last** reverses the most recent stock move, including its effect on reservations. It's refused if the project it touched has since been closed or deleted.
 - **Adjust stock** in Inventory sets a part's count directly. Every stock change is listed in History.
 
 ## Not in the first version

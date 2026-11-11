@@ -26,14 +26,20 @@ COMMITTED = "committed"
 COMPLETE = "complete"
 CANCELLED = "cancelled"
 
+_VERSION = 2
+
 _SCHEMA = """
+CREATE TABLE locations (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
 CREATE TABLE parts (
     id INTEGER PRIMARY KEY,
     mpn TEXT NOT NULL,
     mpn_key TEXT NOT NULL UNIQUE,
     manufacturer TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
-    location TEXT NOT NULL DEFAULT '',
+    location_id INTEGER REFERENCES locations(id) ON DELETE SET NULL,
     on_hand INTEGER NOT NULL DEFAULT 0 CHECK (on_hand >= 0),
     created_at TEXT NOT NULL
 );
@@ -97,6 +103,10 @@ class WorkflowError(ValueError):
 
 def part_key(text: str) -> str:
     return " ".join(text.split()).upper()
+
+
+def _clean_name(text: str) -> str:
+    return " ".join(text.split())
 
 
 def _now() -> str:
@@ -195,8 +205,30 @@ class Inventory:
         self.conn = sqlite3.connect(str(path))
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
-        if self.conn.execute("PRAGMA user_version").fetchone()[0] == 0:
-            self.conn.executescript(_SCHEMA + "PRAGMA user_version = 1;")
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if version == 0:
+            self.conn.executescript(_SCHEMA + f"PRAGMA user_version = {_VERSION};")
+        elif version == 1:
+            self._migrate_from_1()
+        elif version > _VERSION:
+            raise WorkflowError("This database was made by a newer version of PartsDB.")
+
+    def _migrate_from_1(self) -> None:
+        """Version 1 stored each part's location as free text. Turn the distinct
+        values into the locations list, merging ones that differ only in case."""
+        self.conn.executescript(
+            """
+            BEGIN;
+            CREATE TABLE locations (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE);
+            INSERT OR IGNORE INTO locations (name)
+                SELECT DISTINCT TRIM(location) FROM parts WHERE TRIM(location) != '' ORDER BY id;
+            ALTER TABLE parts ADD COLUMN location_id INTEGER REFERENCES locations(id) ON DELETE SET NULL;
+            UPDATE parts SET location_id = (SELECT id FROM locations WHERE name = TRIM(parts.location));
+            ALTER TABLE parts DROP COLUMN location;
+            PRAGMA user_version = 2;
+            COMMIT;
+            """
+        )
 
     def close(self) -> None:
         self.conn.close()
@@ -211,7 +243,7 @@ class Inventory:
             return self._parts_where("1 = 1", ())
         like = f"%{search.strip()}%"
         return self._parts_where(
-            "(p.mpn LIKE ? OR p.description LIKE ? OR p.manufacturer LIKE ? OR p.location LIKE ? OR "
+            "(p.mpn LIKE ? OR p.description LIKE ? OR p.manufacturer LIKE ? OR loc.name LIKE ? OR "
             "p.id IN (SELECT part_id FROM supplier_pns WHERE pn LIKE ?))",
             (like, like, like, like, like),
         )
@@ -219,12 +251,12 @@ class Inventory:
     def _parts_where(self, where: str, params: tuple) -> list[Part]:
         rows = self.conn.execute(
             f"""
-            SELECT p.id, p.mpn, p.manufacturer, p.description, p.location, p.on_hand,
+            SELECT p.id, p.mpn, p.manufacturer, p.description, COALESCE(loc.name, '') AS location, p.on_hand,
                 COALESCE((SELECT SUM(qty) FROM allocations a WHERE a.part_id = p.id AND a.state = 'reserved'), 0) AS reserved,
                 COALESCE((SELECT SUM(qty) FROM allocations a WHERE a.part_id = p.id AND a.state = 'pending'), 0) AS pending,
                 COALESCE((SELECT pn FROM supplier_pns s WHERE s.part_id = p.id AND s.supplier = 'digikey' LIMIT 1), '') AS digikey_pn,
                 COALESCE((SELECT pn FROM supplier_pns s WHERE s.part_id = p.id AND s.supplier = 'mouser' LIMIT 1), '') AS mouser_pn
-            FROM parts p WHERE {where} ORDER BY p.mpn_key
+            FROM parts p LEFT JOIN locations loc ON loc.id = p.location_id WHERE {where} ORDER BY p.mpn_key
             """,
             params,
         ).fetchall()
@@ -270,20 +302,54 @@ class Inventory:
                 (part_id, supplier, pn.strip(), part_key(pn)),
             )
 
-    def add_part(self, mpn: str, manufacturer: str = "", description: str = "", location: str = "") -> Part:
+    def add_part(self, mpn: str, manufacturer: str = "", description: str = "", location: str = "",
+                 supplier: str | None = None, supplier_pn: str | None = None) -> Part:
         with self.conn:
             part_id = self._get_or_create_part(mpn, manufacturer, description)
+            self._learn_supplier_pn(part_id, supplier, supplier_pn)
             if location:
-                self.conn.execute("UPDATE parts SET location = ? WHERE id = ?", (location, part_id))
+                self.conn.execute("UPDATE parts SET location_id = ? WHERE id = ?", (self._location_id(location), part_id))
         return self.get_part(part_id)
 
     def update_part(self, part_id: int, **fields: str) -> None:
+        """Change manufacturer, description or location. A location must already be
+        in the locations list; an empty one clears it."""
         allowed = {"manufacturer", "description", "location"}
         if not fields or not fields.keys() <= allowed:
             raise ValueError(f"Editable fields are {sorted(allowed)}")
-        assignments = ", ".join(f"{name} = ?" for name in fields)
         with self.conn:
-            self.conn.execute(f"UPDATE parts SET {assignments} WHERE id = ?", (*fields.values(), part_id))
+            if "location" in fields:
+                location = fields.pop("location")
+                location_id = self._location_id(location) if location.strip() else None
+                self.conn.execute("UPDATE parts SET location_id = ? WHERE id = ?", (location_id, part_id))
+            if fields:
+                assignments = ", ".join(f"{name} = ?" for name in fields)
+                self.conn.execute(f"UPDATE parts SET {assignments} WHERE id = ?", (*fields.values(), part_id))
+
+    # ---- locations ----
+
+    def list_locations(self) -> list[str]:
+        return [row["name"] for row in self.conn.execute("SELECT name FROM locations ORDER BY name COLLATE NOCASE")]
+
+    def find_location(self, name: str) -> str | None:
+        """The stored spelling of a location, matched ignoring case and extra spaces."""
+        row = self.conn.execute("SELECT name FROM locations WHERE name = ?", (_clean_name(name),)).fetchone()
+        return row["name"] if row else None
+
+    def add_location(self, name: str) -> str:
+        """Add a location, or return the existing one if it only differs in case or spacing."""
+        cleaned = _clean_name(name)
+        if not cleaned:
+            raise WorkflowError("A location needs a name.")
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO locations (name) VALUES (?)", (cleaned,))
+        return self.find_location(cleaned)
+
+    def _location_id(self, name: str) -> int:
+        row = self.conn.execute("SELECT id FROM locations WHERE name = ?", (_clean_name(name),)).fetchone()
+        if row is None:
+            raise WorkflowError(f"\"{name.strip()}\" isn't in the locations list. Add it first.")
+        return row["id"]
 
     def adjust_stock(self, part_id: int, new_on_hand: int, note: str = "") -> None:
         if new_on_hand < 0:

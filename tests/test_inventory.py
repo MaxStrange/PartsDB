@@ -315,6 +315,7 @@ def test_export_lists_only_parts_to_buy(db, make_project, tmp_path):
 
 
 def test_search(db):
+    db.add_location("Drawer 3")
     db.add_part("ABC", description="op amp", location="Drawer 3")
     db.add_part("DEF")
     assert [p.mpn for p in db.list_parts("drawer")] == ["ABC"]
@@ -354,3 +355,52 @@ def test_delete_closed_project(db, make_project):
     db.finish_project(project.id)
     db.delete_project(project.id)
     assert project.id not in [p.id for p in db.list_projects()]
+
+
+def test_locations_ignore_case_and_spacing(db):
+    assert db.add_location("  Drawer   3 ") == "Drawer 3"
+    assert db.add_location("drawer 3") == "Drawer 3"
+    db.add_location("bin A")
+    assert db.list_locations() == ["bin A", "Drawer 3"]
+    assert db.find_location("DRAWER 3") == "Drawer 3"
+    assert db.find_location("Drawer 4") is None
+    with pytest.raises(WorkflowError):
+        db.add_location("   ")
+
+
+def test_part_location_must_be_in_the_list(db):
+    part = db.add_part("ABC")
+    with pytest.raises(WorkflowError, match="locations list"):
+        db.update_part(part.id, location="HelloWorld caps")
+    with pytest.raises(WorkflowError, match="locations list"):
+        db.add_part("DEF", location="nowhere")
+    db.add_location("Drawer 3")
+    db.update_part(part.id, location="drawer 3", description="op amp")
+    part = db.get_part(part.id)
+    assert (part.location, part.description) == ("Drawer 3", "op amp")
+    db.update_part(part.id, location="")
+    assert db.get_part(part.id).location == ""
+
+
+def test_version_1_database_is_upgraded(tmp_path):
+    import sqlite3
+
+    from partsdb.inventory import _SCHEMA
+
+    v1_schema = _SCHEMA.split("CREATE TABLE parts", 1)[1].replace(
+        "location_id INTEGER REFERENCES locations(id) ON DELETE SET NULL", "location TEXT NOT NULL DEFAULT ''"
+    )
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("CREATE TABLE parts" + v1_schema + "PRAGMA user_version = 1;")
+    for mpn, location in [("A", "Drawer 3"), ("B", "drawer 3 "), ("C", ""), ("D", "Bin 1")]:
+        conn.execute("INSERT INTO parts (mpn, mpn_key, location, created_at) VALUES (?, ?, ?, '')", (mpn, mpn, location))
+    conn.commit()
+    conn.close()
+
+    db = Inventory(path)
+    assert db.list_locations() == ["Bin 1", "Drawer 3"]
+    assert [p.location for p in db.list_parts()] == ["Drawer 3", "Drawer 3", "", "Bin 1"]
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    db.close()
+    Inventory(path).close()  # opening again leaves it alone

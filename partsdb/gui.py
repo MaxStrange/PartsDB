@@ -6,10 +6,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QStandardPaths, Qt, QTimer
+from PySide6.QtCore import QEvent, QItemSelectionModel, QStandardPaths, QStringListModel, Qt, QTimer
 from PySide6.QtGui import QColor, QKeyEvent
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QAbstractItemView, QApplication, QButtonGroup, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QPushButton,
     QRadioButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
@@ -103,6 +103,196 @@ class ImportDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+
+
+class LocationCombo(QComboBox):
+    """Pick a storage location from the list, so the same place is always spelled the same way.
+
+    Typing filters the list, ignoring case. The last entry adds a new location.
+    Leaving it empty means no location.
+    """
+
+    ADD_TEXT = "Add new location..."
+    _ADD = "__add__"
+
+    def __init__(self, db: Inventory, current: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.db = db
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.lineEdit().setPlaceholderText("Type to filter, or pick from the list")
+        self._names = QStringListModel(self)
+        completer = QCompleter(self._names, self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.setCompleter(completer)
+        self._last_text = current
+        self.currentTextChanged.connect(self._remember_text)
+        self.activated.connect(self._on_activated)
+        self.reload(current)
+
+    def reload(self, select: str = "") -> None:
+        names = self.db.list_locations()
+        self.blockSignals(True)
+        self.clear()
+        self.addItems(names)
+        self.insertSeparator(self.count())
+        self.addItem(self.ADD_TEXT, self._ADD)
+        self._names.setStringList(names)
+        self.setCurrentIndex(-1)
+        self.setEditText(select)
+        self._last_text = select
+        self.blockSignals(False)
+
+    def _remember_text(self, text: str) -> None:
+        if text != self.ADD_TEXT:
+            self._last_text = text
+
+    def _on_activated(self, index: int) -> None:
+        if self.itemData(index) != self._ADD:
+            return
+        typed = self._last_text.strip()
+        suggestion = "" if self.db.find_location(typed) else typed
+        name = self.ask_new_name(suggestion)
+        if not name or not name.strip():
+            previous = self._last_text  # clearing the selection below overwrites it
+            self.setCurrentIndex(-1)
+            self.setEditText(previous)
+            return
+        self.reload(self.db.add_location(name))
+
+    def ask_new_name(self, suggestion: str) -> str | None:
+        name, ok = QInputDialog.getText(self, "New location", "Location name:", text=suggestion)
+        return name if ok else None
+
+    def confirm_add(self, name: str) -> bool:
+        answer = QMessageBox.question(
+            self, "New location", f"\"{name}\" isn't in the locations list yet. Add it?"
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def resolve(self) -> str | None:
+        """The chosen location in its stored spelling, "" for none, or None if the
+        user typed a name that isn't in the list and declined to add it."""
+        text = " ".join(self.currentText().split())
+        if not text:
+            return ""
+        existing = self.db.find_location(text)
+        if existing:
+            return existing
+        if self.confirm_add(text):
+            name = self.db.add_location(text)
+            self.reload(name)
+            return name
+        return None
+
+
+class LocationDialog(QDialog):
+    """Set the location of one or more parts."""
+
+    def __init__(self, db: Inventory, title: str, current: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Set location")
+        form = QFormLayout(self)
+        form.addRow(QLabel(title))
+        self.combo = LocationCombo(db, current)
+        self.combo.setMinimumWidth(280)
+        form.addRow("Location", self.combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.on_ok)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.value: str | None = None
+
+    def on_ok(self) -> None:
+        self.value = self.combo.resolve()
+        if self.value is not None:
+            self.accept()
+
+
+class AddPartDialog(QDialog):
+    """Add a part by scanning its bag or typing its details."""
+
+    def __init__(self, db: Inventory, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Add part")
+        self.supplier: str | None = None
+        form = QFormLayout(self)
+        self.scan = ScanLineEdit()
+        self.scan.setPlaceholderText("Scan a bag here to fill in the fields below")
+        self.status = QLabel("Stock starts at 0. Use Scan in or Adjust stock to add parts.")
+        self.status.setWordWrap(True)
+        self.mpn = QLineEdit()
+        self.manufacturer = QLineEdit()
+        self.description = QLineEdit()
+        self.location = LocationCombo(db)
+        self.supplier_pn = QLineEdit()
+        self.supplier_label = QLabel("Supplier PN")
+        form.addRow("Scan", self.scan)
+        form.addRow(self.status)
+        form.addRow("MPN", self.mpn)
+        form.addRow("Manufacturer", self.manufacturer)
+        form.addRow("Description", self.description)
+        form.addRow("Location", self.location)
+        form.addRow(self.supplier_label, self.supplier_pn)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.on_ok)
+        self.buttons.rejected.connect(self.reject)
+        form.addRow(self.buttons)
+        self.scan.setFocus()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        # A scanner ends with Enter. In the scan field that means "read this",
+        # not "press OK" on a half-filled form.
+        if self.focusWidget() is self.scan and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.on_scan()
+            return
+        super().keyPressEvent(event)
+
+    def on_scan(self) -> None:
+        text = self.scan.text()
+        self.scan.clear()
+        if not text.strip():
+            return
+        try:
+            label = parse_scan(text)
+        except BarcodeError as error:
+            self.status.setText(str(error))
+            return
+        if not label.mpn:
+            self.status.setText("That label has no manufacturer part number. Type it in below.")
+            return
+        self.mpn.setText(label.mpn)
+        if label.manufacturer:
+            self.manufacturer.setText(label.manufacturer)
+        self.supplier = label.supplier if label.supplier_pn else None
+        self.supplier_pn.setText(label.supplier_pn or "")
+        self.supplier_label.setText({"digikey": "DigiKey PN", "mouser": "Mouser PN"}.get(self.supplier, "Supplier PN"))
+        self.status.setText(f"Read {label.mpn}. Stock starts at 0; use Scan in or Adjust stock to add parts.")
+        self.location.setFocus()
+
+    def on_ok(self) -> None:
+        if not self.mpn.text().strip():
+            self.status.setText("Scan a bag or type an MPN first.")
+            return
+        location = self.location.resolve()
+        if location is None:
+            self.location.setFocus()
+            return
+        self.location.setEditText(location)
+        self.accept()
+
+    def values(self) -> dict:
+        supplier_pn = self.supplier_pn.text().strip()
+        return {
+            "mpn": self.mpn.text().strip(),
+            "manufacturer": self.manufacturer.text().strip(),
+            "description": self.description.text().strip(),
+            "location": " ".join(self.location.currentText().split()),
+            "supplier": self.supplier if supplier_pn else None,
+            "supplier_pn": supplier_pn or None,
+        }
 
 
 class SubstituteDialog(QDialog):
@@ -579,7 +769,8 @@ class ScanTab(QWidget):
 class InventoryTab(QWidget):
     COLUMNS = ["MPN", "Manufacturer", "Description", "Location", "DigiKey PN", "Mouser PN",
                "On hand", "Reserved", "Free", "On order"]
-    EDITABLE = {1: "manufacturer", 2: "description", 3: "location"}
+    EDITABLE = {1: "manufacturer", 2: "description"}
+    C_LOCATION = 3
 
     def __init__(self, db: Inventory):
         super().__init__()
@@ -590,11 +781,14 @@ class InventoryTab(QWidget):
         self.search.textChanged.connect(lambda _: self.refresh())
         add_button = QPushButton("Add part...")
         add_button.clicked.connect(self.add_part)
+        location_button = QPushButton("Set location...")
+        location_button.clicked.connect(self.set_location)
         adjust_button = QPushButton("Adjust stock...")
         adjust_button.clicked.connect(self.adjust)
         top = QHBoxLayout()
         top.addWidget(self.search, 1)
         top.addWidget(add_button)
+        top.addWidget(location_button)
         top.addWidget(adjust_button)
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
@@ -602,6 +796,9 @@ class InventoryTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemChanged.connect(self.on_item_changed)
+        self.table.cellDoubleClicked.connect(
+            lambda row, column: self.set_location() if column == self.C_LOCATION else None
+        )
         layout = QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(self.table, 1)
@@ -614,7 +811,7 @@ class InventoryTab(QWidget):
         for row, part in enumerate(parts):
             mpn = _item(part.mpn)
             mpn.setData(Qt.ItemDataRole.UserRole, part.id)
-            values = [mpn, _item(part.manufacturer, True), _item(part.description, True), _item(part.location, True),
+            values = [mpn, _item(part.manufacturer, True), _item(part.description, True), _item(part.location),
                       _item(part.digikey_pn), _item(part.mouser_pn), _item(part.on_hand), _item(part.reserved),
                       _item(part.available, color=_RED if part.available < 0 else None), _item(part.pending)]
             for column, item in enumerate(values):
@@ -628,14 +825,53 @@ class InventoryTab(QWidget):
         self.db.update_part(part_id, **{self.EDITABLE[item.column()]: item.text().strip()})
 
     def add_part(self) -> None:
-        mpn, ok = QInputDialog.getText(self, "Add part", "Manufacturer part number:")
-        if not ok or not mpn.strip():
+        dialog = AddPartDialog(self.db, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        self.save_new_part(dialog.values())
+
+    def save_new_part(self, values: dict) -> None:
         try:
-            self.db.add_part(mpn)
+            part = self.db.add_part(**values)
         except WorkflowError as error:
             _show_error(self, error)
+            return
+        self.search.clear()
         self.refresh()
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 0).data(Qt.ItemDataRole.UserRole) == part.id:
+                self.table.selectRow(row)
+
+    def selected_part_ids(self) -> list[int]:
+        rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+        if not rows and self.table.currentRow() >= 0:
+            rows = [self.table.currentRow()]
+        return [self.table.item(row, 0).data(Qt.ItemDataRole.UserRole) for row in rows]
+
+    def set_location(self) -> None:
+        part_ids = self.selected_part_ids()
+        if not part_ids:
+            _show_error(self, "Select one or more parts first.")
+            return
+        parts = [self.db.get_part(part_id) for part_id in part_ids]
+        current = {part.location for part in parts}
+        title = f"Where is {parts[0].mpn} kept?" if len(parts) == 1 else f"Where are these {len(parts)} parts kept?"
+        location = self.ask_location(title, current.pop() if len(current) == 1 else "")
+        if location is None:
+            return
+        for part_id in part_ids:
+            self.db.update_part(part_id, location=location)
+        self.refresh()
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 0).data(Qt.ItemDataRole.UserRole) in part_ids:
+                self.table.selectionModel().select(
+                    self.table.model().index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+                )
+
+    def ask_location(self, title: str, current: str) -> str | None:
+        dialog = LocationDialog(self.db, title, current, self)
+        return dialog.value if dialog.exec() == QDialog.DialogCode.Accepted else None
 
     def adjust(self) -> None:
         row = self.table.currentRow()

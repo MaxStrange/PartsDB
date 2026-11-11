@@ -7,7 +7,7 @@ from PySide6.QtWidgets import QApplication
 
 from conftest import stock
 from partsdb.barcode import EOT, GS, RS, parse_scan
-from partsdb.gui import MainWindow, ProjectsTab, ScanLineEdit, ScanTab
+from partsdb.gui import AddPartDialog, InventoryTab, LocationCombo, MainWindow, ProjectsTab, ScanLineEdit, ScanTab
 
 LABEL = f"[)>{RS}06{GS}1PABC{GS}30PABC-ND{GS}Q10{RS}{EOT}"
 
@@ -173,3 +173,102 @@ def test_delete_button_works_on_reserved_project(app, db, make_project, monkeypa
     assert tab.projects.count() == 0
     assert not tab.delete_button.isEnabled()
     assert db.find_part("ABC").available == 10
+
+
+def test_add_part_dialog_fills_fields_from_a_scan(app, db):
+    db.add_location("Drawer 3")
+    dialog = AddPartDialog(db)
+    dialog.show()
+    dialog.scan.setFocus()
+    dialog.scan.setText(LABEL.replace(GS, "␝").replace(RS, "␞").replace(EOT, "␄"))
+    QTest.keyClick(dialog.scan, Qt.Key.Key_Return)
+    assert dialog.result() == 0 and dialog.isVisible()  # Enter from the scanner doesn't press OK
+    assert dialog.mpn.text() == "ABC"
+    assert dialog.supplier_pn.text() == "ABC-ND"
+    assert dialog.supplier_label.text() == "DigiKey PN"
+    assert dialog.scan.text() == ""
+    dialog.location.setEditText("drawer 3")
+    dialog.on_ok()
+    assert dialog.result() == 1
+    tab = InventoryTab(db)
+    tab.save_new_part(dialog.values())
+    dialog.close()
+    part = db.find_part(supplier_pn="ABC-ND")
+    assert (part.mpn, part.location, part.on_hand) == ("ABC", "Drawer 3", 0)
+    assert tab.table.currentRow() == 0
+
+
+def test_add_part_dialog_plain_text_and_bad_scan(app, db):
+    dialog = AddPartDialog(db)
+    dialog.scan.setText(f"[)>{RS}06 1PABC Q10")
+    dialog.on_scan()
+    assert "separators" in dialog.status.text()
+    assert dialog.mpn.text() == ""
+    dialog.on_ok()
+    assert dialog.result() == 0
+    dialog.scan.setText("LM358DR")
+    dialog.on_scan()
+    assert dialog.mpn.text() == "LM358DR"
+    assert dialog.values()["supplier_pn"] is None
+
+
+def test_location_combo_filters_ignoring_case(app, db):
+    for name in ("Drawer 3", "HelloWorld drawer", "Bin A"):
+        db.add_location(name)
+    combo = LocationCombo(db)
+    names = [combo.itemText(i) for i in range(combo.count()) if combo.itemText(i)]
+    assert names == ["Bin A", "Drawer 3", "HelloWorld drawer", LocationCombo.ADD_TEXT]
+    completer = combo.completer()
+    completer.setCompletionPrefix("DRAW")
+    matches = [completer.completionModel().index(i, 0).data() for i in range(completer.completionCount())]
+    assert matches == ["Drawer 3", "HelloWorld drawer"]
+
+
+def test_location_combo_add_new_entry(app, db):
+    db.add_location("Drawer 3")
+    combo = LocationCombo(db)
+    combo.setEditText("shelf 2")
+    asked = []
+    combo.ask_new_name = lambda suggestion: asked.append(suggestion) or "Shelf 2"
+    combo.activated.emit(combo.count() - 1)
+    assert asked == ["shelf 2"]
+    assert db.list_locations() == ["Drawer 3", "Shelf 2"]
+    assert combo.currentText() == "Shelf 2"
+    # Cancelling the name prompt puts back what was there.
+    combo.ask_new_name = lambda suggestion: None
+    combo.activated.emit(combo.count() - 1)
+    assert combo.currentText() == "Shelf 2"
+
+
+def test_location_combo_unknown_text_needs_confirmation(app, db):
+    db.add_location("Drawer 3")
+    combo = LocationCombo(db, "drawer  3")
+    combo.confirm_add = lambda name: pytest.fail("existing location shouldn't prompt")
+    assert combo.resolve() == "Drawer 3"
+    combo.setEditText("HelloWorld caps")
+    combo.confirm_add = lambda name: False
+    assert combo.resolve() is None
+    assert db.list_locations() == ["Drawer 3"]
+    combo.confirm_add = lambda name: True
+    assert combo.resolve() == "HelloWorld caps"
+    combo.setEditText("  ")
+    assert combo.resolve() == ""
+
+
+def test_inventory_sets_location_for_selected_parts(app, db):
+    db.add_location("Drawer 3")
+    for mpn in ("A", "B", "C"):
+        db.add_part(mpn)
+    tab = InventoryTab(db)
+    tab.table.selectRow(0)
+    tab.table.selectionModel().select(
+        tab.table.model().index(2, 0),
+        tab.table.selectionModel().SelectionFlag.Select | tab.table.selectionModel().SelectionFlag.Rows,
+    )
+    asked = []
+    tab.ask_location = lambda title, current: asked.append((title, current)) or "Drawer 3"
+    tab.set_location()
+    assert asked == [("Where are these 2 parts kept?", "")]
+    assert [p.location for p in db.list_parts()] == ["Drawer 3", "", "Drawer 3"]
+    assert tab.table.item(0, tab.C_LOCATION).text() == "Drawer 3"
+    assert not tab.table.item(0, tab.C_LOCATION).flags() & Qt.ItemFlag.ItemIsEditable

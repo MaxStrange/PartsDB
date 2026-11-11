@@ -37,6 +37,10 @@ Completing or cancelling returns unused reservations to free stock and drops any
 
 A project can be deleted in any state. Deleting releases its reservations and drops its pending parts like cancelling does, but also removes its BOM. On-hand counts don't change, and its stock moves stay in History without a project name. Undo can't reverse a move that touched a deleted project.
 
+## Locations
+
+A part's location is picked from a fixed list, so the same drawer is always spelled the same way. Typing filters the list, ignoring case. **Add new location...** at the bottom of the list adds one. Typing a name that isn't in the list asks before adding it, and names that differ only in case or spacing count as the same location. Location can be set when adding a part, or for several selected parts at once in Inventory.
+
 ## Corrections
 
 - **Undo last** reverses the most recent stock move, including its effect on reservations. It's refused if the project it touched has since been closed or deleted.

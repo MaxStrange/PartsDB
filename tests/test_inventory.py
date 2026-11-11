@@ -257,7 +257,7 @@ def test_locked_after_commit(db, make_project):
     db.commit_project(project.id)
     line = db.get_lines(project.id)[0]
     for action in (lambda: db.set_line_mpn(line.id, "X"), lambda: db.set_line_from_stock(line.id, 0),
-                   lambda: db.set_line_dnp(line.id, True), lambda: db.delete_project(project.id)):
+                   lambda: db.set_line_dnp(line.id, True)):
         with pytest.raises(WorkflowError, match="locked"):
             action()
 
@@ -329,3 +329,28 @@ def test_data_survives_reopen(tmp_path):
     second = Inventory(path)
     assert second.find_part(mpn="ABC").on_hand == 5
     second.close()
+
+
+def test_delete_committed_project_frees_reservations_and_keeps_history(db, make_project):
+    part = db.add_part("ABC")
+    db.adjust_stock(part.id, 10, "count")
+    project = make_project("p", [("ABC", 6)])
+    db.set_line_from_stock(db.get_lines(project.id)[0].id, 4)
+    db.commit_project(project.id)
+    db.consume(part.id, 3, project.id)
+    moves_before = len(db.list_moves())
+    db.delete_project(project.id)
+    assert db.get_part(part.id).on_hand == 7
+    assert db.get_part(part.id).available == 7
+    assert db.expected_lines(part.id) == []
+    assert len(db.list_moves()) == moves_before
+    with pytest.raises(WorkflowError, match="deleted"):
+        db.undo_last()
+
+
+def test_delete_closed_project(db, make_project):
+    project = make_project("p", [("ABC", 1)])
+    db.commit_project(project.id)
+    db.finish_project(project.id)
+    db.delete_project(project.id)
+    assert project.id not in [p.id for p in db.list_projects()]

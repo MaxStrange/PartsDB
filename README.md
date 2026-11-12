@@ -16,7 +16,9 @@ pip install -e ".[dev]"
 python -m partsdb
 ```
 
-The database lives in your app data folder, and the status bar shows where. Use `--db path/to/parts.db` to choose another file. To back up, close the app and copy that file.
+The database is `~/Dropbox/3DPrints/parts.db`, so it's backed up and survives losing the computer. The status bar shows the path. If that file is missing at startup, the app asks before creating an empty one, because on a new computer Dropbox may still be syncing it. Use `--db path/to/parts.db` to choose another file.
+
+Only run the app on one computer at a time. SQLite isn't built for a file that Dropbox syncs while two copies are open, and Dropbox would make a conflicted copy.
 
 ## Test
 

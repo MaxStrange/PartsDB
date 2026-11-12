@@ -23,6 +23,7 @@ def scan_tab(app, db):
     tab.ask_quantity = lambda *a: pytest.fail("unexpected quantity prompt")
     tab.confirm = lambda *a: pytest.fail("unexpected confirm prompt")
     tab.ask_substitute = lambda *a: pytest.fail("unexpected substitute prompt")
+    tab.ask_did_you_mean = lambda *a: pytest.fail("unexpected did-you-mean prompt")
     return tab
 
 
@@ -272,3 +273,200 @@ def test_inventory_sets_location_for_selected_parts(app, db):
     assert [p.location for p in db.list_parts()] == ["Drawer 3", "", "Drawer 3"]
     assert tab.table.item(0, tab.C_LOCATION).text() == "Drawer 3"
     assert not tab.table.item(0, tab.C_LOCATION).flags() & Qt.ItemFlag.ItemIsEditable
+
+
+def test_inventory_search_finds_a_scanned_label(app, db):
+    for mpn in ("ABC", "DEF"):
+        db.add_part(mpn)
+    tab = InventoryTab(db)
+    tab.search.setText(LABEL.replace(GS, "␝").replace(RS, "␞").replace(EOT, "␄"))
+    assert tab.table.rowCount() == 2  # waits for typing to pause
+    QTest.qWait(300)
+    assert [tab.table.item(r, 0).text() for r in range(tab.table.rowCount())] == ["ABC"]
+    tab.search.setText("de")
+    tab.search.returnPressed.emit()  # Enter searches straight away
+    assert [tab.table.item(r, 0).text() for r in range(tab.table.rowCount())] == ["DEF"]
+
+
+def test_scan_in_typo_offers_the_close_match(scan_tab, db, make_project):
+    project = make_project("p", [("E3V3HBPC1A", 1)])
+    db.commit_project(project.id)
+    asked = []
+    scan_tab.ask_did_you_mean = lambda mpn, similar: asked.append((mpn, similar)) or similar[0][0]
+    scan_tab.ask_quantity = lambda *a: 4
+    do_scan(scan_tab, "E3VHBPC1A")
+    assert asked[0][0] == "E3VHBPC1A"
+    assert db.find_part(mpn="E3VHBPC1A") is None
+    line = db.get_lines(project.id)[0]
+    assert (line.reserved, line.substitutes) == (1, [])
+    assert db.find_part(mpn="E3V3HBPC1A").on_hand == 4
+
+
+def test_scan_in_typo_can_be_kept_or_cancelled(scan_tab, db):
+    db.add_part("E3V3HBPC1A")
+    scan_tab.ask_did_you_mean = lambda mpn, similar: None
+    do_scan(scan_tab, "E3VHBPC1A")
+    assert db.find_part(mpn="E3VHBPC1A") is None
+    scan_tab.ask_did_you_mean = lambda mpn, similar: mpn
+    scan_tab.ask_quantity = lambda *a: 2
+    do_scan(scan_tab, "E3VHBPC1A")
+    assert db.find_part(mpn="E3VHBPC1A").on_hand == 2
+
+
+def test_inventory_merge_button(app, db, make_project):
+    project = make_project("p", [("E3V3HBPC1A", 1)])
+    db.commit_project(project.id)
+    wrong = db.receive("E3VHBPC1A", 4, substitute_for_line=db.get_lines(project.id)[0].id).part
+    tab = InventoryTab(db)
+    row = next(r for r in range(tab.table.rowCount()) if tab.table.item(r, 0).text() == "E3VHBPC1A")
+    tab.table.selectRow(row)
+    tab.ask_merge_target = lambda part: "E3V3HBPC1A"
+    tab.confirm_merge = lambda part, target: True
+    tab.merge()
+    assert [tab.table.item(r, 0).text() for r in range(tab.table.rowCount())] == ["E3V3HBPC1A"]
+    assert tab.table.currentRow() == 0
+    assert db.find_part(mpn="E3V3HBPC1A").on_hand == 4
+    assert db.find_part(mpn="E3VHBPC1A") is None and wrong.id != tab.table.item(0, 0).data(Qt.ItemDataRole.UserRole)
+
+
+def test_merge_dialog_lists_close_matches_first(app, db):
+    for mpn in ("AAAA1", "E3V3HBPC1A", "ZZZZ9"):
+        db.add_part(mpn)
+    wrong = db.add_part("E3VHBPC1A")
+    from partsdb.gui import MergeDialog
+
+    dialog = MergeDialog(db, wrong)
+    assert dialog.names == ["E3V3HBPC1A", "AAAA1", "ZZZZ9"]
+    assert dialog.combo.currentText() == "E3V3HBPC1A"
+    dialog.combo.setEditText("nonsense")
+    dialog.on_ok()
+    assert dialog.choice is None and "from the list" in dialog.error.text()
+    dialog.combo.setEditText("zzzz9")
+    dialog.on_ok()
+    assert dialog.choice == "ZZZZ9"
+
+
+def _inventory_with(db, *mpns):
+    for mpn in mpns:
+        db.add_part(mpn)
+    tab = InventoryTab(db)
+    tab.show()
+    return tab
+
+
+def test_copy_menu_for_one_row(app, db):
+    from partsdb.gui import _copy_actions
+
+    tab = _inventory_with(db, "ABC", "DEF")
+    tab.table.selectRow(1)
+    actions = _copy_actions(tab.table, 1, 0)
+    assert actions[0] == ("Copy MPN: DEF", "DEF")
+    label, row_text = actions[1]
+    assert label == "Copy row" and row_text.split("\t")[0] == "DEF"
+    assert len(row_text.split("\t")) == len(tab.COLUMNS)
+
+
+def test_copy_menu_for_several_rows_and_unselected_click(app, db):
+    from partsdb.gui import _copy_actions
+
+    tab = _inventory_with(db, "ABC", "DEF", "GHI")
+    model = tab.table.selectionModel()
+    tab.table.selectRow(0)
+    model.select(tab.table.model().index(2, 0), model.SelectionFlag.Select | model.SelectionFlag.Rows)
+    assert _copy_actions(tab.table, 2, 0)[0] == ("Copy MPN (2 rows)", "ABC\nGHI")
+    # Right-clicking a row outside the selection copies just that row.
+    assert _copy_actions(tab.table, 1, 0)[0] == ("Copy MPN: DEF", "DEF")
+
+
+def test_ctrl_c_copies_the_clicked_column(app, db):
+    tab = _inventory_with(db, "ABC", "DEF")
+    db_part = db.find_part(mpn="DEF")
+    db.add_location("Drawer 3")
+    db.update_part(db_part.id, location="Drawer 3")
+    tab.refresh()
+    tab.table.setCurrentCell(1, tab.C_LOCATION)
+    tab.table.setFocus()
+    QApplication.clipboard().clear()
+    QTest.keyClick(tab.table, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    assert QApplication.clipboard().text() == "Drawer 3"
+
+
+def test_copy_from_lists_and_hidden_columns(app, db, make_project, scan_tab):
+    from partsdb.gui import _copy_actions, _copy_selection
+
+    scan_tab._log("first line")
+    scan_tab._log("second line")
+    scan_tab.log.setCurrentRow(0)
+    assert _copy_selection(scan_tab.log) == "second line"
+    assert _copy_actions(scan_tab.log, 1) == [("Copy", "first line")]
+
+    project = make_project("p", [("ABC", 1)])
+    tab = ProjectsTab(db)
+    tab.refresh(project.id)
+    row_text = _copy_actions(tab.table, 0, 0)[-1][1]
+    visible = [c for c in range(tab.table.columnCount()) if not tab.table.isColumnHidden(c)]
+    assert len(row_text.split("\t")) == len(visible) < tab.table.columnCount()
+
+
+def test_inventory_use_for_project(app, db, make_project, monkeypatch):
+    from partsdb.gui import UseStockDialog
+
+    project = make_project("p", [("ABC", 5)])
+    db.commit_project(project.id)
+    part = db.find_part(mpn="ABC")
+    db.adjust_stock(part.id, 3)
+    tab = InventoryTab(db)
+    tab.table.selectRow(0)
+    seen = []
+
+    def answer(part, lines):
+        dialog = UseStockDialog(part, lines)
+        seen.append((dialog.qty.maximum(), dialog.qty.value(), dialog.line.currentText()))
+        return dialog.choice()
+
+    tab.ask_use_stock = answer
+    tab.use_for_project()
+    assert seen == [(3, 3, "p: R1, waiting on 5")]
+    assert (db.get_lines(project.id)[0].reserved, db.get_lines(project.id)[0].pending) == (3, 2)
+    assert tab.table.item(0, tab.COLUMNS.index("On order")).text() == "2"
+
+    errors = []
+    monkeypatch.setattr("partsdb.gui._show_error", lambda parent, error: errors.append(str(error)))
+    tab.use_for_project()  # no free stock left
+    assert "None of ABC are free" in errors[-1]
+    db.add_part("XYZ")
+    tab.refresh()
+    tab.table.selectRow(1)
+    tab.use_for_project()
+    assert "No project is waiting on XYZ" in errors[-1]
+
+
+def test_projects_tab_fill_from_stock(app, db, make_project):
+    project = make_project("p", [("AAA", 4), ("BBB", 2)])
+    db.commit_project(project.id)
+    db.adjust_stock(db.find_part(mpn="AAA").id, 10)
+    tab = ProjectsTab(db)
+    tab.refresh(project.id)
+    assert tab.fill_button.isEnabled()
+    shown = []
+    tab.confirm_fill = lambda project, plan: shown.append(tab._describe_fill(plan)) or True
+    tab.fill_button.click()
+    assert "Reserve 4 parts from free stock for 1 lines" in shown[0]
+    assert "keep waiting on 2 parts" in shown[0]
+    assert [line.pending for line in db.get_lines(project.id)] == [0, 2]
+    notes = []
+    tab.notify = notes.append
+    tab.fill_button.click()
+    assert "none of the 1 waiting lines" in notes[0]
+    db.receive("BBB", 2)
+    tab.refresh(project.id)
+    assert not tab.fill_button.isEnabled()
+
+
+def test_scanning_an_alternate_needs_no_substitute_prompt(scan_tab, db, make_project):
+    project = make_project("p", [("0527452096;59453-082110ECHLF", 1)])
+    db.commit_project(project.id)
+    scan_tab.ask_quantity = lambda *a: 1
+    do_scan(scan_tab, "59453-082110ECHLF")
+    line = db.get_lines(project.id)[0]
+    assert (line.reserved, line.pending, line.substitutes) == (1, 0, [])

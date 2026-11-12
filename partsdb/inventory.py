@@ -105,6 +105,29 @@ def part_key(text: str) -> str:
     return " ".join(text.split()).upper()
 
 
+def alternates(mpn: str) -> list[str]:
+    """The part numbers a BOM line accepts. A symbol can list deliberate
+    alternates separated by ';', and any one of them fills the line."""
+    return [part.strip() for part in mpn.split(";") if part.strip()]
+
+
+def _alternate_keys(mpn: str) -> set[str]:
+    return {part_key(part) for part in alternates(mpn)}
+
+
+def _edit_distance(a: str, b: str, limit: int) -> int:
+    """Levenshtein distance, giving up early once it's past ``limit``."""
+    previous = list(range(len(b) + 1))
+    for i, char_a in enumerate(a, start=1):
+        current = [i]
+        for j, char_b in enumerate(b, start=1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (char_a != char_b)))
+        if min(current) > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
+
+
 def _clean_name(text: str) -> str:
     return " ".join(text.split())
 
@@ -192,6 +215,25 @@ class MoveResult:
     placements: list[Placement] = field(default_factory=list)
     free_qty: int = 0
     warning: str = ""
+
+
+@dataclass
+class BulkLine:
+    line_id: int
+    part_id: int  # the part reserved (or, for a line left short, the part still awaited)
+    refs: str
+    mpn: str
+    qty: int
+
+
+@dataclass
+class BulkFill:
+    filled: list[BulkLine] = field(default_factory=list)
+    short: list[BulkLine] = field(default_factory=list)  # qty here is what's still waiting
+
+    @property
+    def total(self) -> int:
+        return sum(line.qty for line in self.filled)
 
 
 @dataclass
@@ -326,6 +368,66 @@ class Inventory:
                 assignments = ", ".join(f"{name} = ?" for name in fields)
                 self.conn.execute(f"UPDATE parts SET {assignments} WHERE id = ?", (*fields.values(), part_id))
 
+    def merge_parts(self, from_id: int, into_id: int) -> Part:
+        """Fold one part into another, for when the same part ended up under two
+        part numbers (a typo, say). Stock, reservations, supplier numbers and
+        history all move to ``into_id``, and ``from_id`` is deleted."""
+        if from_id == into_id:
+            raise WorkflowError("Pick a different part to merge into.")
+        source, target = self.get_part(from_id), self.get_part(into_id)
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE parts SET on_hand = on_hand + ?,
+                    manufacturer = CASE manufacturer WHEN '' THEN ? ELSE manufacturer END,
+                    description = CASE description WHEN '' THEN ? ELSE description END,
+                    location_id = COALESCE(location_id, (SELECT location_id FROM parts WHERE id = ?))
+                WHERE id = ?
+                """,
+                (source.on_hand, source.manufacturer, source.description, from_id, into_id),
+            )
+            for alloc in self.conn.execute(
+                "SELECT line_id, state, qty FROM allocations WHERE part_id = ?", (from_id,)
+            ).fetchall():
+                self._alloc(alloc["line_id"], into_id, alloc["state"], alloc["qty"])
+            self.conn.execute("DELETE FROM allocations WHERE part_id = ?", (from_id,))
+            # A supplier number is unique on its own, so it can simply change owner.
+            self.conn.execute("UPDATE supplier_pns SET part_id = ? WHERE part_id = ?", (into_id, from_id))
+            # Undo replays each move's allocation changes, which name the part.
+            for move in self.conn.execute(
+                "SELECT id, alloc_deltas FROM stock_moves WHERE alloc_deltas LIKE '%' || ? || '%'", (from_id,)
+            ).fetchall():
+                deltas = [[line, into_id if part == from_id else part, state, delta]
+                          for line, part, state, delta in json.loads(move["alloc_deltas"])]
+                self.conn.execute("UPDATE stock_moves SET alloc_deltas = ? WHERE id = ?", (json.dumps(deltas), move["id"]))
+            self.conn.execute("UPDATE stock_moves SET part_id = ? WHERE part_id = ?", (into_id, from_id))
+            self.conn.execute("DELETE FROM parts WHERE id = ?", (from_id,))
+        return self.get_part(target.id)
+
+    def similar_mpns(self, mpn: str, max_distance: int = 2) -> list[tuple[str, str]]:
+        """Known part numbers within a character or two of ``mpn``, closest first, as
+        (mpn, note) pairs. Catches typos and misreads before they become new parts."""
+        key = part_key(mpn)
+        if len(key) < 4:
+            return []
+        limit = 1 if len(key) < 7 else max_distance
+        waiting: dict[str, str] = {}
+        for line in self.open_lines():
+            for alt in alternates(line.mpn):
+                waiting.setdefault(part_key(alt), f"{line.project_name} is waiting on {line.pending} for {line.refs}")
+        rows = self.conn.execute("SELECT mpn, on_hand FROM parts").fetchall()
+        candidates = {part_key(row["mpn"]): row["mpn"] for row in rows}
+        on_hand = {part_key(row["mpn"]): row["on_hand"] for row in rows}
+        candidates.update({k: k for k in waiting if k not in candidates})
+        matches = []
+        for candidate_key, candidate in candidates.items():
+            if candidate_key == key or abs(len(candidate_key) - len(key)) > limit:
+                continue
+            distance = _edit_distance(key, candidate_key, limit)
+            if distance <= limit:
+                matches.append((distance, candidate_key not in waiting, candidate, waiting.get(candidate_key, f"{on_hand.get(candidate_key, 0)} on hand")))
+        return [(candidate, note) for *_, candidate, note in sorted(matches)]
+
     # ---- locations ----
 
     def list_locations(self) -> list[str]:
@@ -391,8 +493,15 @@ class Inventory:
         return self.get_project(project_id)
 
     def _suggest_from_stock(self, mpn: str, required: int) -> int:
-        part = self.find_part(mpn=mpn) if mpn else None
-        return max(0, min(required, part.available)) if part else 0
+        return max(0, min(required, self._free_for(mpn)))
+
+    def _alternate_parts(self, mpn: str) -> list[Part]:
+        """Parts in the database for each of a line's alternates, in the order listed."""
+        found = [self.find_part(mpn=alt) for alt in alternates(mpn)]
+        return [part for part in found if part is not None]
+
+    def _free_for(self, mpn: str) -> int:
+        return sum(max(part.available, 0) for part in self._alternate_parts(mpn))
 
     def get_project(self, project_id: int) -> Project:
         row = self.conn.execute(
@@ -416,8 +525,8 @@ class Inventory:
             data = dict(row)
             data["dnp"] = bool(data["dnp"])
             line = Line(**data)
-            part = self.find_part(mpn=line.mpn) if line.mpn else None
-            line.available = part.available if part else 0
+            line.available = self._free_for(line.mpn)
+            accepted = _alternate_keys(line.mpn)
             for alloc in self.conn.execute(
                 """
                 SELECT a.state, a.qty, p.mpn, p.mpn_key FROM allocations a JOIN parts p ON p.id = a.part_id
@@ -426,7 +535,7 @@ class Inventory:
                 (line.id,),
             ):
                 setattr(line, alloc["state"], getattr(line, alloc["state"]) + alloc["qty"])
-                if alloc["mpn_key"] != part_key(line.mpn) and alloc["mpn"] not in line.substitutes:
+                if alloc["mpn_key"] not in accepted and alloc["mpn"] not in line.substitutes:
                     line.substitutes.append(alloc["mpn"])
             lines.append(line)
         return lines
@@ -470,8 +579,12 @@ class Inventory:
         for line in self.get_lines(project_id):
             qty = line.to_order if project.status == PLANNING else line.pending
             if qty > 0:
-                rows.append([qty, line.mpn, line.manufacturer, line.digikey_pn, line.mouser_pn,
-                             line.refs, line.value, line.footprint])
+                # Distributor upload tools can't read "A;B", so send the first choice. Supplier
+                # numbers listed the same way can't be paired with it reliably, so they're left out.
+                mpn = (alternates(line.mpn) or [""])[0]
+                digikey = "" if ";" in line.digikey_pn else line.digikey_pn
+                mouser = "" if ";" in line.mouser_pn else line.mouser_pn
+                rows.append([qty, mpn, line.manufacturer, digikey, mouser, line.refs, line.value, line.footprint])
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
             writer.writerow(["Quantity", "Manufacturer Part Number", "Manufacturer", "Digi-Key Part Number",
@@ -496,18 +609,25 @@ class Inventory:
             raise WorkflowError("These lines need an MPN or a DNP mark first: " + "; ".join(missing))
         with self.conn:
             for line in lines:
-                part_id = self._get_or_create_part(line.mpn, line.manufacturer, line.description)
-                self._learn_supplier_pn(part_id, "digikey", line.digikey_pn)
-                self._learn_supplier_pn(part_id, "mouser", line.mouser_pn)
+                choices = alternates(line.mpn)
+                part_id = self._get_or_create_part(choices[0], line.manufacturer, line.description)
+                if len(choices) == 1:
+                    self._learn_supplier_pn(part_id, "digikey", line.digikey_pn)
+                    self._learn_supplier_pn(part_id, "mouser", line.mouser_pn)
                 # Stock can change after planning, and earlier lines in this loop
                 # have already reserved theirs, so check against the current count.
-                free = self.get_part(part_id).available
+                free = self._free_for(line.mpn)
                 if line.from_stock > free:
                     raise WorkflowError(
                         f"{line.mpn}: only {free} free in stock now, but line {line.refs} takes {line.from_stock}. "
                         "Lower \"Use from stock\" and try again."
                     )
-                self._alloc(line.id, part_id, "reserved", line.from_stock)
+                left = line.from_stock
+                for part in self._alternate_parts(line.mpn):
+                    take = min(left, max(self.get_part(part.id).available, 0))
+                    self._alloc(line.id, part.id, "reserved", take)
+                    left -= take
+                # Anything still to come is awaited as the first alternate listed.
                 self._alloc(line.id, part_id, "pending", line.qty_required - line.from_stock)
             self.conn.execute("UPDATE projects SET status = ? WHERE id = ?", (COMMITTED, project_id))
 
@@ -574,7 +694,8 @@ class Inventory:
     def list_moves(self, limit: int = 500) -> list[sqlite3.Row]:
         return self.conn.execute(
             """
-            SELECT m.id, m.created_at, m.kind, m.delta, m.note, m.undone, p.mpn, pr.name AS project
+            SELECT m.id, m.created_at, m.kind, m.delta, m.note, m.undone,
+                CASE m.kind WHEN 'bulk_from_stock' THEN '(several)' ELSE p.mpn END AS mpn, pr.name AS project
             FROM stock_moves m JOIN parts p ON p.id = m.part_id LEFT JOIN projects pr ON pr.id = m.project_id
             ORDER BY m.id DESC LIMIT ?
             """,
@@ -610,6 +731,12 @@ class Inventory:
                 raise WorkflowError("Can't undo: those parts have already been used.")
             self.conn.execute("UPDATE parts SET on_hand = ? WHERE id = ?", (on_hand, move["part_id"]))
             self.conn.execute("UPDATE stock_moves SET undone = 1 WHERE id = ?", (move["id"],))
+        if move["kind"] == "bulk_from_stock":
+            lines = {line_id for line_id, _, state, _ in deltas if state == "reserved"}
+            return f"reserving stock for {len(lines)} waiting lines"
+        if move["kind"] == "from_stock":
+            qty = sum(delta for _, _, state, delta in deltas if state == "reserved")
+            return f'reserving {qty} x {move["mpn"]} from stock'
         return f'{move["kind"].replace("_", " ")} of {abs(move["delta"])} x {move["mpn"]}'
 
     # ---- scanning in ----
@@ -619,7 +746,107 @@ class Inventory:
         return self._open_lines_where("1 = 1", ())
 
     def expected_lines(self, part_id: int) -> list[OpenLine]:
-        return self._open_lines_where("a.part_id = ?", (part_id,))
+        """Lines waiting on this part, including lines that list it as an alternate."""
+        direct = {line.line_id for line in self._open_lines_where("a.part_id = ?", (part_id,))}
+        key = part_key(self.get_part(part_id).mpn)
+        return [line for line in self.open_lines() if line.line_id in direct or key in _alternate_keys(line.mpn)]
+
+    def expected_lines_for_mpn(self, mpn: str) -> list[OpenLine]:
+        """Lines waiting on a part number that isn't in the database yet."""
+        key = part_key(mpn)
+        return [line for line in self.open_lines() if key in _alternate_keys(line.mpn)]
+
+    def _take_pending(self, line_id: int, part_id: int, qty: int, log: list) -> None:
+        """Reduce a line's pending quantity by ``qty``, from this part's pending first.
+        The part that arrived can differ from the one awaited, when it's an alternate
+        or a substitute."""
+        rows = self.conn.execute(
+            "SELECT part_id, qty FROM allocations WHERE line_id = ? AND state = 'pending' ORDER BY part_id = ? DESC",
+            (line_id, part_id),
+        ).fetchall()
+        for row in rows:
+            take = min(qty, row["qty"])
+            self._alloc(line_id, row["part_id"], "pending", -take, log)
+            qty -= take
+
+    def plan_fill_from_stock(self, project_id: int) -> BulkFill:
+        """What fill_from_stock would do, without changing anything."""
+        if self.get_project(project_id).status != COMMITTED:
+            raise WorkflowError("Only a project with parts on order has lines waiting.")
+        rows = self.conn.execute(
+            """
+            SELECT a.line_id, a.part_id, a.qty, l.refs, p.mpn
+            FROM allocations a JOIN bom_lines l ON l.id = a.line_id JOIN parts p ON p.id = a.part_id
+            WHERE l.project_id = ? AND a.state = 'pending' ORDER BY l.id
+            """,
+            (project_id,),
+        ).fetchall()
+        line_mpns = {
+            row["id"]: row["mpn"]
+            for row in self.conn.execute("SELECT id, mpn FROM bom_lines WHERE project_id = ?", (project_id,))
+        }
+        free: dict[int, int] = {}
+        plan = BulkFill()
+        for row in rows:
+            # The awaited part first, then any alternates the line lists.
+            candidates = [self.get_part(row["part_id"])] + [
+                part for part in self._alternate_parts(line_mpns[row["line_id"]]) if part.id != row["part_id"]
+            ]
+            waiting = row["qty"]
+            for part in candidates:
+                if part.id not in free:
+                    free[part.id] = max(part.available, 0)
+                take = min(waiting, free[part.id])
+                if take:
+                    free[part.id] -= take
+                    waiting -= take
+                    plan.filled.append(BulkLine(row["line_id"], part.id, row["refs"], part.mpn, take))
+            if waiting:
+                plan.short.append(BulkLine(row["line_id"], row["part_id"], row["refs"], row["mpn"], waiting))
+        return plan
+
+    def fill_from_stock(self, project_id: int) -> BulkFill:
+        """Reserve free stock for every line of the project that's waiting on a delivery,
+        as far as stock allows. Recorded as one move, so Undo reverses all of it."""
+        plan = self.plan_fill_from_stock(project_id)
+        if not plan.filled:
+            return plan
+        log: list = []
+        with self.conn:
+            for fill in plan.filled:
+                self._take_pending(fill.line_id, fill.part_id, fill.qty, log)
+                self._alloc(fill.line_id, fill.part_id, "reserved", fill.qty, log)
+            self._record_move(
+                plan.filled[0].part_id, 0, "bulk_from_stock", project_id,
+                note=f"Reserved free stock for {len(plan.filled)} waiting lines ({plan.total} parts)", alloc_log=log,
+            )
+        return plan
+
+    def use_stock_for_line(self, line_id: int, part_id: int, qty: int) -> MoveResult:
+        """Stop waiting for a delivery and reserve parts already in free stock instead.
+
+        Moves ``qty`` of the line's pending quantity for this part to reserved. On-hand
+        doesn't change: the parts are already here, they're just set aside now.
+        """
+        if qty <= 0:
+            raise WorkflowError("Quantity must be at least 1.")
+        line = next((l for l in self.expected_lines(part_id) if l.line_id == line_id), None)
+        if line is None:
+            raise WorkflowError("That line isn't waiting on this part any more.")
+        part = self.get_part(part_id)
+        if qty > line.pending:
+            raise WorkflowError(f"{line.project_name} {line.refs} is only waiting on {line.pending}.")
+        if qty > part.available:
+            raise WorkflowError(f"Only {part.available} of {part.mpn} are free in stock.")
+        log: list = []
+        with self.conn:
+            self._take_pending(line_id, part_id, qty, log)
+            self._alloc(line_id, part_id, "reserved", qty, log)
+            move_id = self._record_move(
+                part_id, 0, "from_stock", line.project_id,
+                note=f"Reserved {qty} from stock for {line.refs} instead of waiting for delivery", alloc_log=log,
+            )
+        return MoveResult(move_id, self.get_part(part_id), qty, [Placement(line.project_name, line.refs, qty)])
 
     def _open_lines_where(self, where: str, params: tuple) -> list[OpenLine]:
         rows = self.conn.execute(
@@ -663,16 +890,7 @@ class Inventory:
                 if remaining == 0:
                     break
                 wanted = min(remaining, target.pending)
-                allocations = self.conn.execute(
-                    "SELECT part_id, qty FROM allocations WHERE line_id = ? AND state = 'pending'"
-                    + ("" if substitute_for_line is not None else " AND part_id = ?"),
-                    (target.line_id,) if substitute_for_line is not None else (target.line_id, part_id),
-                ).fetchall()
-                left = wanted
-                for alloc in allocations:
-                    take = min(left, alloc["qty"])
-                    self._alloc(target.line_id, alloc["part_id"], "pending", -take, log)
-                    left -= take
+                self._take_pending(target.line_id, part_id, wanted, log)
                 self._alloc(target.line_id, part_id, "reserved", wanted, log)
                 placements.append(Placement(target.project_name, target.refs, wanted))
                 remaining -= wanted
@@ -684,16 +902,22 @@ class Inventory:
 
     def project_line_for_part(self, project_id: int, part_id: int) -> int | None:
         """The line in this project that this part belongs to, if any."""
-        part = self.get_part(part_id)
-        row = self.conn.execute(
+        key = part_key(self.get_part(part_id).mpn)
+        rows = self.conn.execute(
             """
-            SELECT l.id FROM bom_lines l LEFT JOIN allocations a ON a.line_id = l.id AND a.part_id = ?
-            WHERE l.project_id = ? AND (a.part_id IS NOT NULL OR UPPER(l.mpn) = ?)
-            ORDER BY a.state = 'reserved' DESC, l.id LIMIT 1
+            SELECT l.id, l.mpn, MAX(a.state = 'reserved') AS reserved, COUNT(a.part_id) AS allocated
+            FROM bom_lines l LEFT JOIN allocations a ON a.line_id = l.id AND a.part_id = ?
+            WHERE l.project_id = ? GROUP BY l.id ORDER BY l.id
             """,
-            (part_id, project_id, part_key(part.mpn)),
-        ).fetchone()
-        return row["id"] if row else None
+            (part_id, project_id),
+        ).fetchall()
+        # Prefer a line holding this part reserved, then any line it's allocated to,
+        # then a line that lists it as one of its part numbers.
+        for test in (lambda r: r["reserved"], lambda r: r["allocated"], lambda r: key in _alternate_keys(r["mpn"])):
+            match = next((row["id"] for row in rows if test(row)), None)
+            if match is not None:
+                return match
+        return None
 
     def reserved_for(self, project_id: int, part_id: int) -> int:
         return self.conn.execute(

@@ -404,3 +404,213 @@ def test_version_1_database_is_upgraded(tmp_path):
     assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 2
     db.close()
     Inventory(path).close()  # opening again leaves it alone
+
+
+def test_merge_parts_moves_stock_reservations_and_history(db, make_project):
+    project = make_project("p", [("E3V3HBPC1A", 1)])
+    db.commit_project(project.id)
+    right = db.find_part(mpn="E3V3HBPC1A")
+    line = db.get_lines(project.id)[0]
+    # The typo'd bag was used as a substitute for the right part's line.
+    result = db.receive("E3VHBPC1A", 4, supplier="digikey", supplier_pn="TYPO-ND", substitute_for_line=line.id)
+    wrong = result.part
+    db.add_location("Drawer 3")
+    db.update_part(wrong.id, location="Drawer 3", description="TVS diode")
+    assert db.get_lines(project.id)[0].substitutes == ["E3VHBPC1A"]
+
+    merged = db.merge_parts(wrong.id, right.id)
+
+    assert (merged.on_hand, merged.reserved, merged.available) == (4, 1, 3)
+    assert (merged.location, merged.description) == ("Drawer 3", "TVS diode")
+    assert db.find_part(mpn="E3VHBPC1A") is None
+    assert db.find_part(supplier_pn="TYPO-ND").id == right.id
+    line = db.get_lines(project.id)[0]
+    assert line.substitutes == []
+    assert line.reserved == 1 and line.pending == 0
+    assert [m["mpn"] for m in db.list_moves()] == ["E3V3HBPC1A"]
+    # Undo still works after the merge, against the merged part.
+    db.undo_last()
+    assert db.get_part(right.id).on_hand == 0
+    assert db.get_lines(project.id)[0].pending == 1
+
+
+def test_merge_combines_allocations_on_the_same_line(db, make_project):
+    project = make_project("p", [("ABCDEF", 4)])
+    db.commit_project(project.id)
+    right = db.find_part(mpn="ABCDEF")
+    line = db.get_lines(project.id)[0]
+    db.receive("ABCDEF", 1)
+    wrong = db.receive("ABCDEX", 2, substitute_for_line=line.id).part
+    db.merge_parts(wrong.id, right.id)
+    line = db.get_lines(project.id)[0]
+    assert (line.reserved, line.pending) == (3, 1)
+
+
+def test_merge_into_itself_is_refused(db):
+    part = db.add_part("ABC")
+    with pytest.raises(WorkflowError):
+        db.merge_parts(part.id, part.id)
+
+
+def test_similar_mpns_finds_typos_and_prefers_waiting_lines(db, make_project):
+    db.add_part("E3V3HBPC1B")
+    project = make_project("p", [("E3V3HBPC1A", 2)])
+    db.commit_project(project.id)
+    similar = db.similar_mpns("e3vhbpc1a")
+    assert [mpn for mpn, _ in similar] == ["E3V3HBPC1A", "E3V3HBPC1B"]
+    assert "waiting on 2" in similar[0][1]
+    assert db.similar_mpns("E3V3HBPC1A") == [("E3V3HBPC1B", "0 on hand")]  # exact match isn't listed
+    assert db.similar_mpns("TOTALLYDIFFERENT") == []
+    db.add_part("LM358")
+    assert db.similar_mpns("LM35") == [("LM358", "0 on hand")]
+    assert db.similar_mpns("LM3") == []  # too short to guess
+
+
+def test_use_stock_for_line_stops_waiting(db, make_project):
+    project = make_project("p", [("ABC", 5)])
+    db.commit_project(project.id)  # nothing in stock yet, so all 5 pending
+    part = db.find_part(mpn="ABC")
+    db.adjust_stock(part.id, 3, "entered in Inventory")
+    line = db.get_lines(project.id)[0]
+    assert (line.reserved, line.pending) == (0, 5)
+
+    result = db.use_stock_for_line(line.id, part.id, 2)
+
+    line = db.get_lines(project.id)[0]
+    assert (line.reserved, line.pending) == (2, 3)
+    part = db.get_part(part.id)
+    assert (part.on_hand, part.reserved, part.available, part.pending) == (3, 2, 1, 3)
+    assert result.placements[0].qty == 2
+    move = db.list_moves()[0]
+    assert (move["kind"], move["delta"], move["project"]) == ("from_stock", 0, "p")
+    assert "reserving 2 x ABC from stock" in db.undo_last()
+    assert db.get_lines(project.id)[0].pending == 5
+
+
+def test_use_stock_for_line_limits(db, make_project):
+    project = make_project("p", [("ABC", 2)])
+    db.commit_project(project.id)
+    part = db.find_part(mpn="ABC")
+    line = db.get_lines(project.id)[0]
+    with pytest.raises(WorkflowError, match="free in stock"):
+        db.use_stock_for_line(line.id, part.id, 1)
+    db.adjust_stock(part.id, 10)
+    with pytest.raises(WorkflowError, match="only waiting on 2"):
+        db.use_stock_for_line(line.id, part.id, 3)
+    with pytest.raises(WorkflowError, match="at least 1"):
+        db.use_stock_for_line(line.id, part.id, 0)
+    db.use_stock_for_line(line.id, part.id, 2)
+    with pytest.raises(WorkflowError, match="isn't waiting"):
+        db.use_stock_for_line(line.id, part.id, 1)
+    # A later delivery now goes to free stock, since nothing is waiting.
+    assert db.receive("ABC", 5).free_qty == 5
+
+
+def test_fill_from_stock_fills_what_it_can_and_undoes_as_one(db, make_project):
+    project = make_project("p", [("AAA", 4), ("BBB", 3), ("CCC", 2), ("AAA2", 1)])
+    db.commit_project(project.id)  # nothing in stock: everything pending
+    for mpn, qty in (("AAA", 10), ("BBB", 1)):
+        db.adjust_stock(db.find_part(mpn=mpn).id, qty)
+    other = make_project("other", [("BBB", 1)])
+    db.set_line_from_stock(db.get_lines(other.id)[0].id, 1)
+    db.commit_project(other.id)  # another project holds the only free BBB
+
+    plan = db.plan_fill_from_stock(project.id)
+    assert [(f.mpn, f.qty) for f in plan.filled] == [("AAA", 4)]
+    assert sorted((s.mpn, s.qty) for s in plan.short) == [("AAA2", 1), ("BBB", 3), ("CCC", 2)]
+    assert db.get_lines(project.id)[0].pending == 4  # the plan changed nothing
+
+    db.fill_from_stock(project.id)
+    by_mpn = {line.mpn: line for line in db.get_lines(project.id)}
+    assert (by_mpn["AAA"].reserved, by_mpn["AAA"].pending) == (4, 0)
+    assert by_mpn["BBB"].pending == 3
+    move = db.list_moves()[0]
+    assert (move["kind"], move["mpn"], move["project"]) == ("bulk_from_stock", "(several)", "p")
+    assert "1 waiting lines" in db.undo_last()
+    assert db.get_lines(project.id)[0].pending == 4
+
+
+def test_fill_from_stock_partial_and_shared_part(db, make_project):
+    project = make_project("p", [("AAA", 3), ("AAA", 3)])  # two lines sharing one part
+    db.commit_project(project.id)
+    db.adjust_stock(db.find_part(mpn="AAA").id, 4)
+    plan = db.fill_from_stock(project.id)
+    assert plan.total == 4 and plan.short[0].qty == 2
+    assert [(line.reserved, line.pending) for line in db.get_lines(project.id)] == [(3, 0), (1, 2)]
+    assert db.find_part(mpn="AAA").available == 0
+    with pytest.raises(WorkflowError):
+        db.plan_fill_from_stock(make_project("planning", [("AAA", 1)]).id)
+
+
+ALT = "0527452096;59453-082110ECHLF"
+
+
+def test_alternates_count_stock_of_either_part(db, make_project):
+    db.adjust_stock(db.add_part("59453-082110ECHLF").id, 1)
+    db.adjust_stock(db.add_part("0527452096").id, 1)
+    project = make_project("p", [(ALT, 3)])
+    line = db.get_lines(project.id)[0]
+    assert (line.available, line.from_stock, line.to_order) == (2, 2, 1)
+    db.commit_project(project.id)
+    line = db.get_lines(project.id)[0]
+    assert (line.reserved, line.pending, line.substitutes) == (2, 1, [])
+    # The remaining one is awaited as the first alternate.
+    assert [l.line_id for l in db.expected_lines(db.find_part(mpn="0527452096").id)] == [line.id]
+
+
+def test_any_alternate_fills_the_line_when_received(db, make_project):
+    project = make_project("p", [(ALT, 2)])
+    db.commit_project(project.id)
+    assert db.find_part(mpn="59453-082110ECHLF") is None
+    assert [l.refs for l in db.expected_lines_for_mpn("59453-082110echlf")] == ["R1"]
+    result = db.receive("59453-082110ECHLF", 5)
+    assert (result.placements[0].qty, result.free_qty) == (2, 3)
+    line = db.get_lines(project.id)[0]
+    assert (line.reserved, line.pending, line.substitutes) == (2, 0, [])
+    assert db.find_part(mpn="0527452096").pending == 0
+    part = db.find_part(mpn="59453-082110ECHLF")
+    assert db.project_line_for_part(project.id, part.id) == line.id
+    db.consume(part.id, 2, project.id)
+    assert db.get_lines(project.id)[0].used == 2
+
+
+def test_fill_from_stock_uses_alternates(db, make_project):
+    project = make_project("p", [(ALT, 3)])
+    db.commit_project(project.id)
+    db.adjust_stock(db.add_part("59453-082110ECHLF").id, 2)
+    plan = db.fill_from_stock(project.id)
+    assert [(f.mpn, f.qty) for f in plan.filled] == [("59453-082110ECHLF", 2)]
+    assert [(s.mpn, s.qty) for s in plan.short] == [("0527452096", 1)]
+    line = db.get_lines(project.id)[0]
+    assert (line.reserved, line.pending) == (2, 1)
+    db.undo_last()
+    assert db.get_lines(project.id)[0].pending == 3
+
+
+def test_use_stock_for_line_with_an_alternate(db, make_project):
+    project = make_project("p", [(ALT, 2)])
+    db.commit_project(project.id)
+    alt = db.add_part("59453-082110ECHLF")
+    db.adjust_stock(alt.id, 5)
+    line = db.expected_lines(alt.id)[0]
+    db.use_stock_for_line(line.line_id, alt.id, 2)
+    assert (db.get_lines(project.id)[0].reserved, db.get_lines(project.id)[0].pending) == (2, 0)
+
+
+def test_order_export_sends_the_first_alternate(db, make_project, tmp_path):
+    import csv as csv_module
+
+    from partsdb.bom import BomRow
+
+    project = db.create_project("p", [BomRow(refs=["J7"], qty=1, mpn=ALT, digikey_pn="X-ND;Y-ND")])
+    path = tmp_path / "order.csv"
+    db.export_order_csv(project.id, path)
+    with open(path, newline="", encoding="utf-8") as handle:
+        row = next(csv_module.DictReader(handle))
+    assert (row["Manufacturer Part Number"], row["Digi-Key Part Number"]) == ("0527452096", "")
+
+
+def test_similar_mpns_checks_each_alternate(db, make_project):
+    project = make_project("p", [(ALT, 1)])
+    db.commit_project(project.id)
+    assert [mpn for mpn, _ in db.similar_mpns("59453-082110ECHL")] == ["59453-082110ECHLF"]

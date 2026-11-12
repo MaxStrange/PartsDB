@@ -104,3 +104,39 @@ def test_file_with_bom_marker_and_non_utf8(tmp_path):
     latin = tmp_path / "latin.csv"
     latin.write_bytes("Reference,Value,MPN\nR1,10\xb5F,ABC\n".encode("cp1252"))
     assert parse_bom_file(latin).rows[0].value == "10\u00b5F"
+
+
+def test_comma_joined_mpns_from_kicad_grouping_are_refused():
+    # KiCad joins differing MPNs with commas when it groups different parts into one row.
+    text = (
+        '"Reference","Qty","Value","MPN"\n'
+        '"C23,C25,C66","3","10uF","CL21A106KAYNNNE,GRM21BR6YA106KE43L"\n'
+        '"R1","1","10k","RC0402"\n'
+    )
+    with pytest.raises(BomError) as error:
+        parse_bom_text(text)
+    message = str(error.value)
+    assert "C23, C25, C66 (CL21A106KAYNNNE,GRM21BR6YA106KE43L)" in message
+    assert "grouped by MPN" in message
+
+
+def test_semicolon_alternates_are_kept_as_one_line():
+    row = parse_bom_text('Reference,MPN\nJ7,"0527452096;59453-082110ECHLF"\n').rows[0]
+    assert row.mpn == "0527452096;59453-082110ECHLF"
+
+
+def test_rows_excluded_from_bom_are_skipped():
+    # The KiCad schematic's own BOM export flags excluded symbols rather than dropping them.
+    text = (
+        '"Reference","Qty","Value","Exclude from BOM","MPN"\n'
+        '"B1","1","BH-18650-PC","Excluded from BOM",""\n'
+        '"R1","1","10k","","RC0402"\n'
+    )
+    bom = parse_bom_text(text)
+    assert [row.refs for row in bom.rows] == [["R1"]]
+    assert "Skipped 1" in bom.warnings[0]
+
+
+def test_in_bom_column_works_the_other_way_round():
+    bom = parse_bom_text('Reference,In BOM,MPN\nR1,yes,A\nR2,no,B\n')
+    assert [row.mpn for row in bom.rows] == ["A"]

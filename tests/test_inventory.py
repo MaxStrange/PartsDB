@@ -256,8 +256,7 @@ def test_locked_after_commit(db, make_project):
     project = make_project("p", [("ABC", 1)])
     db.commit_project(project.id)
     line = db.get_lines(project.id)[0]
-    for action in (lambda: db.set_line_mpn(line.id, "X"), lambda: db.set_line_from_stock(line.id, 0),
-                   lambda: db.set_line_dnp(line.id, True)):
+    for action in (lambda: db.set_line_mpn(line.id, "X"), lambda: db.set_line_from_stock(line.id, 0)):
         with pytest.raises(WorkflowError, match="locked"):
             action()
 
@@ -614,3 +613,62 @@ def test_similar_mpns_checks_each_alternate(db, make_project):
     project = make_project("p", [(ALT, 1)])
     db.commit_project(project.id)
     assert [mpn for mpn, _ in db.similar_mpns("59453-082110ECHL")] == ["59453-082110ECHLF"]
+
+
+def test_dnp_on_a_reserved_project_releases_and_restores(db, make_project):
+    db.adjust_stock(db.add_part("ABC").id, 3)
+    project = make_project("p", [("ABC", 5), ("DEF", 1)])
+    db.commit_project(project.id)
+    line = db.get_lines(project.id)[0]
+    assert (line.reserved, line.pending) == (3, 2)
+
+    db.set_line_dnp(line.id, True)
+    line = db.get_lines(project.id)[0]
+    assert (line.dnp, line.reserved, line.pending) == (True, 0, 0)
+    part = db.find_part(mpn="ABC")
+    assert (part.available, part.pending) == (3, 0)
+    assert db.expected_lines(part.id) == []
+    assert db.receive("ABC", 4).free_qty == 4  # a late delivery goes to free stock
+
+    db.set_line_dnp(line.id, False)
+    line = db.get_lines(project.id)[0]
+    assert (line.dnp, line.reserved, line.pending) == (False, 5, 0)  # 7 free now, so all 5 reserved
+    db.set_line_dnp(line.id, False)  # no change is fine
+    assert db.get_lines(project.id)[0].reserved == 5
+
+
+def test_dnp_after_some_were_used_keeps_the_used_count(db, make_project):
+    part = db.add_part("ABC")
+    db.adjust_stock(part.id, 2)
+    project = make_project("p", [("ABC", 4)])
+    db.commit_project(project.id)
+    db.consume(part.id, 1, project.id)
+    line = db.get_lines(project.id)[0]
+    db.set_line_dnp(line.id, True)
+    assert (db.get_lines(project.id)[0].used, db.find_part(mpn="ABC").available) == (1, 1)
+    db.set_line_dnp(line.id, False)
+    line = db.get_lines(project.id)[0]
+    assert (line.used, line.reserved, line.pending) == (1, 1, 2)  # 3 still needed: 1 free, 2 awaited
+
+
+def test_dnp_rules_on_reserved_and_closed_projects(db, make_project):
+    project = make_project("p", [("ABC", 1)])
+    line = db.get_lines(project.id)[0]
+    db.set_line_mpn(line.id, "")
+    db.set_line_dnp(line.id, True)
+    db.commit_project(project.id)
+    with pytest.raises(WorkflowError, match="needs an MPN"):
+        db.set_line_dnp(line.id, False)
+    db.finish_project(project.id)
+    with pytest.raises(WorkflowError, match="closed"):
+        db.set_line_dnp(line.id, False)
+
+
+def test_dnp_with_alternates_reserves_either(db, make_project):
+    project = make_project("p", [("A1;B2", 2)])
+    db.set_line_dnp(db.get_lines(project.id)[0].id, True)
+    db.commit_project(project.id)
+    db.adjust_stock(db.add_part("B2").id, 2)
+    db.set_line_dnp(db.get_lines(project.id)[0].id, False)
+    line = db.get_lines(project.id)[0]
+    assert (line.reserved, line.pending, line.substitutes) == (2, 0, [])

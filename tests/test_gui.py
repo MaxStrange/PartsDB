@@ -470,3 +470,21 @@ def test_scanning_an_alternate_needs_no_substitute_prompt(scan_tab, db, make_pro
     do_scan(scan_tab, "59453-082110ECHLF")
     line = db.get_lines(project.id)[0]
     assert (line.reserved, line.pending, line.substitutes) == (1, 0, [])
+
+
+def test_dnp_checkbox_works_on_a_reserved_project(app, db, make_project):
+    stock(db, "ABC", 3)
+    project = make_project("p", [("ABC", 5)])
+    db.commit_project(project.id)
+    tab = ProjectsTab(db)
+    tab.refresh(project.id)
+    box = tab.table.item(0, tab.C_DNP)
+    assert box.flags() & Qt.ItemFlag.ItemIsUserCheckable
+    box.setCheckState(Qt.CheckState.Checked)
+    QApplication.processEvents()
+    assert db.get_lines(project.id)[0].dnp
+    assert tab.table.item(0, tab.C_STATUS).text() == "DNP"
+    assert db.find_part(mpn="ABC").available == 3
+    db.finish_project(project.id)
+    tab.refresh(project.id)
+    assert not tab.table.item(0, tab.C_DNP).flags() & Qt.ItemFlag.ItemIsUserCheckable

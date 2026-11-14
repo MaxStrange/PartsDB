@@ -619,7 +619,9 @@ class ProjectsTab(QWidget):
         status, color = self._status(line, planning)
         dnp = _item("")
         flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
-        dnp.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable if planning else flags)
+        project = self.current_project()
+        can_change = project is not None and project.status in (PLANNING, COMMITTED)
+        dnp.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable if can_change else flags)
         dnp.setCheckState(Qt.CheckState.Checked if line.dnp else Qt.CheckState.Unchecked)
         dnp.setData(Qt.ItemDataRole.UserRole, line.id)
         self.table.setItem(row, self.C_DNP, dnp)

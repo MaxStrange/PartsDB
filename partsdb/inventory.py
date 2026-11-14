@@ -566,11 +566,48 @@ class Inventory:
         return clamped
 
     def set_line_dnp(self, line_id: int, dnp: bool) -> None:
+        """Mark a line Do Not Place, or undo that.
+
+        While planning this only changes what gets ordered. Once parts are reserved,
+        marking a line DNP releases its reserved parts to free stock and stops waiting
+        for any still on order, as if that line alone were cancelled. Unmarking it
+        reserves free stock again and waits for the rest. Parts already used stay used.
+        """
         line = self._get_line(line_id)
-        self._require_planning(line.project_id)
-        from_stock = 0 if dnp else self._suggest_from_stock(line.mpn, line.qty_required)
+        status = self.get_project(line.project_id).status
+        if status == PLANNING:
+            from_stock = 0 if dnp else self._suggest_from_stock(line.mpn, line.qty_required)
+            with self.conn:
+                self.conn.execute("UPDATE bom_lines SET dnp = ?, from_stock = ? WHERE id = ?", (int(dnp), from_stock, line_id))
+            return
+        if status != COMMITTED:
+            raise WorkflowError("This project is closed.")
+        if dnp == line.dnp:
+            return
+        if not dnp and not line.mpn:
+            raise WorkflowError("This line needs an MPN before it can be fitted.")
         with self.conn:
-            self.conn.execute("UPDATE bom_lines SET dnp = ?, from_stock = ? WHERE id = ?", (int(dnp), from_stock, line_id))
+            if dnp:
+                self.conn.execute(
+                    "DELETE FROM allocations WHERE line_id = ? AND state IN ('reserved', 'pending')", (line_id,)
+                )
+            else:
+                needed = max(line.qty_required - line.used, 0)
+                self._reserve_or_await(line_id, line.mpn, needed, min(needed, self._free_for(line.mpn)))
+            self.conn.execute("UPDATE bom_lines SET dnp = ? WHERE id = ?", (int(dnp), line_id))
+
+    def _reserve_or_await(self, line_id: int, mpn: str, needed: int, from_stock: int) -> int:
+        """Reserve ``from_stock`` of a line's parts from free stock, taking each listed
+        alternate in turn, and await the rest of ``needed`` as the first alternate.
+        Returns the id of the awaited part."""
+        part_id = self._get_or_create_part(alternates(mpn)[0])
+        left = from_stock
+        for part in self._alternate_parts(mpn):
+            take = min(left, max(self.get_part(part.id).available, 0))
+            self._alloc(line_id, part.id, "reserved", take)
+            left -= take
+        self._alloc(line_id, part_id, "pending", needed - from_stock)
+        return part_id
 
     def export_order_csv(self, project_id: int, path: str | Path) -> int:
         """Write the parts still to buy, for upload to a distributor. Returns the line count."""
@@ -622,13 +659,7 @@ class Inventory:
                         f"{line.mpn}: only {free} free in stock now, but line {line.refs} takes {line.from_stock}. "
                         "Lower \"Use from stock\" and try again."
                     )
-                left = line.from_stock
-                for part in self._alternate_parts(line.mpn):
-                    take = min(left, max(self.get_part(part.id).available, 0))
-                    self._alloc(line.id, part.id, "reserved", take)
-                    left -= take
-                # Anything still to come is awaited as the first alternate listed.
-                self._alloc(line.id, part_id, "pending", line.qty_required - line.from_stock)
+                self._reserve_or_await(line.id, line.mpn, line.qty_required, line.from_stock)
             self.conn.execute("UPDATE projects SET status = ? WHERE id = ?", (COMMITTED, project_id))
 
     def finish_project(self, project_id: int, status: str = COMPLETE) -> FinishSummary:

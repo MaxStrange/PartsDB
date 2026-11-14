@@ -488,3 +488,50 @@ def test_dnp_checkbox_works_on_a_reserved_project(app, db, make_project):
     db.finish_project(project.id)
     tab.refresh(project.id)
     assert not tab.table.item(0, tab.C_DNP).flags() & Qt.ItemFlag.ItemIsUserCheckable
+
+
+def _click_header(table, column):
+    from PySide6.QtCore import QPoint
+
+    header = table.horizontalHeader()
+    x = header.sectionViewportPosition(column) + header.sectionSize(column) // 2
+    QTest.mouseClick(header.viewport(), Qt.MouseButton.LeftButton, pos=QPoint(x, header.height() // 2))
+
+
+def _column(table, column):
+    return [table.item(r, column).text() for r in range(table.rowCount())]
+
+
+def test_inventory_sorts_numbers_by_value_and_clears_on_third_click(app, db):
+    for mpn, qty in (("C10", 9), ("C2", 10), ("C1", 100)):
+        stock(db, mpn, qty)
+    tab = InventoryTab(db)
+    tab.resize(1200, 400)
+    tab.show()
+    on_hand = tab.COLUMNS.index("On hand")
+    assert _column(tab.table, 0) == ["C1", "C10", "C2"]  # database order to start with
+    _click_header(tab.table, on_hand)
+    assert _column(tab.table, on_hand) == ["9", "10", "100"]
+    _click_header(tab.table, on_hand)
+    assert _column(tab.table, on_hand) == ["100", "10", "9"]
+    tab.refresh()  # a refresh keeps the chosen sort
+    assert _column(tab.table, on_hand) == ["100", "10", "9"]
+    _click_header(tab.table, on_hand)
+    assert _column(tab.table, 0) == ["C1", "C10", "C2"]
+    _click_header(tab.table, 0)
+    assert _column(tab.table, 0) == ["C1", "C2", "C10"]  # read like a person would
+
+
+def test_sorted_bom_table_still_edits_the_right_line(app, db, make_project):
+    project = make_project("p", [("ZZZ", 1), ("AAA", 2)])
+    db.commit_project(project.id)
+    tab = ProjectsTab(db)
+    tab.resize(1400, 400)
+    tab.show()
+    tab.refresh(project.id)
+    _click_header(tab.table, tab.C_MPN)
+    assert _column(tab.table, tab.C_MPN) == ["AAA", "ZZZ"]
+    tab.table.item(0, tab.C_DNP).setCheckState(Qt.CheckState.Checked)
+    QApplication.processEvents()
+    assert {line.mpn: line.dnp for line in db.get_lines(project.id)} == {"ZZZ": False, "AAA": True}
+    assert _column(tab.table, tab.C_MPN) == ["AAA", "ZZZ"]  # sort survives the reload

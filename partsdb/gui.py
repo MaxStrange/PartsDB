@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -80,14 +81,49 @@ def _filling(table: QTableWidget):
     Resizing columns to their contents as each cell is set re-measures the
     whole table every time, which took seconds for a few hundred rows.
     """
+    sorting = table.isSortingEnabled()
+    # Rows would otherwise jump around as cells are filled in.
+    table.setSortingEnabled(False)
     table.setUpdatesEnabled(False)
     table.blockSignals(True)
     try:
         yield
     finally:
         table.blockSignals(False)
+        table.setSortingEnabled(sorting)  # re-applies the column the user sorted by, if any
         table.resizeColumnsToContents()
         table.setUpdatesEnabled(True)
+
+
+def _make_sortable(table: QTableWidget, restore_order) -> None:
+    """Click a header to sort by it, again to reverse, and a third time to go back
+    to the original order, which ``restore_order`` rebuilds."""
+    header = table.horizontalHeader()
+    header.setSortIndicatorClearable(True)
+    header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+    table.setSortingEnabled(True)
+    header.sortIndicatorChanged.connect(lambda section, _order: restore_order() if section < 0 else None)
+
+
+_SORT_KEY = Qt.ItemDataRole.UserRole + 1
+
+
+def _sort_key(value):
+    """Numbers by value, and text the way people read it: C2 before C10."""
+    if isinstance(value, bool):
+        return (0, int(value))
+    if isinstance(value, int):
+        return (0, value)
+    text = "" if value is None else str(value)
+    return (1, tuple((0, int(part)) if part.isdigit() else (1, part.lower()) for part in re.split(r"(\d+)", text) if part))
+
+
+class _SortItem(QTableWidgetItem):
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        mine, theirs = self.data(_SORT_KEY), other.data(_SORT_KEY)
+        if mine is None or theirs is None:
+            return super().__lt__(other)
+        return mine < theirs
 
 
 def _selected_rows(view: QTableWidget | QListWidget) -> list[int]:
@@ -164,7 +200,8 @@ def _make_copyable(view: QTableWidget | QListWidget) -> None:
 
 
 def _item(value, editable: bool = False, color: QColor | None = None) -> QTableWidgetItem:
-    item = QTableWidgetItem("" if value is None else str(value))
+    item = _SortItem("" if value is None else str(value))
+    item.setData(_SORT_KEY, _sort_key(value))
     flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
     if editable:
         flags |= Qt.ItemFlag.ItemIsEditable
@@ -525,6 +562,7 @@ class ProjectsTab(QWidget):
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
         _make_copyable(self.table)
+        _make_sortable(self.table, lambda: self._restore_order())
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -590,6 +628,9 @@ class ProjectsTab(QWidget):
         self.projects.blockSignals(False)
         self.load_lines()
 
+    def _restore_order(self) -> None:
+        self.load_lines()
+
     def load_lines(self) -> None:
         project = self.current_project()
         self._loading = True
@@ -624,6 +665,7 @@ class ProjectsTab(QWidget):
         dnp.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable if can_change else flags)
         dnp.setCheckState(Qt.CheckState.Checked if line.dnp else Qt.CheckState.Unchecked)
         dnp.setData(Qt.ItemDataRole.UserRole, line.id)
+        dnp.setData(_SORT_KEY, _sort_key(line.dnp))
         self.table.setItem(row, self.C_DNP, dnp)
         cells = {
             self.C_REFS: _item(line.refs),
@@ -1057,6 +1099,7 @@ class InventoryTab(QWidget):
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
         _make_copyable(self.table)
+        _make_sortable(self.table, lambda: self._restore_order())
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -1067,6 +1110,9 @@ class InventoryTab(QWidget):
         layout = QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(self.table, 1)
+        self.refresh()
+
+    def _restore_order(self) -> None:
         self.refresh()
 
     def refresh(self) -> None:
@@ -1239,10 +1285,14 @@ class HistoryTab(QWidget):
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
         _make_copyable(self.table)
+        _make_sortable(self.table, lambda: self._restore_order())
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         QVBoxLayout(self).addWidget(self.table)
+        self.refresh()
+
+    def _restore_order(self) -> None:
         self.refresh()
 
     def refresh(self) -> None:
